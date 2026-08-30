@@ -1,0 +1,169 @@
+#!/bin/bash
+# Analyzes usage-tracker logs and reports never-used binaries and libraries.
+# Run after track-usage has collected 2-3 days of data.
+
+LOG_DIR="/var/log/usage-tracker"
+RAW_BIN="$LOG_DIR/raw-bin.log"
+RAW_LIB="$LOG_DIR/raw-lib.log"
+REPORT="$LOG_DIR/usage-report-$(date +%Y%m%d-%H%M).txt"
+
+BIN_DIRS="/bin /sbin /usr/bin /usr/sbin"
+LIB_DIRS="/usr/lib64 /usr/lib /lib /lib64"
+
+# Minimum days of data before reporting is meaningful
+MIN_DAYS=1
+
+check_data() {
+    if [ ! -f "$RAW_BIN" ] && [ ! -f "$RAW_LIB" ]; then
+        echo "No tracking data found. Run: track-usage start"
+        exit 1
+    fi
+
+    if [ -f "$RAW_BIN" ]; then
+        days=$(awk '{print $1}' "$RAW_BIN" 2>/dev/null | sort -u | wc -l)
+        echo "Binary tracking data spans $days day(s)."
+        [ "$days" -lt "$MIN_DAYS" ] && echo "WARNING: Less than $MIN_DAYS day(s) of data — results may miss infrequently-used tools."
+    fi
+}
+
+report_binaries() {
+    echo ""
+    echo "=== BINARY USAGE REPORT ==="
+    echo ""
+
+    # Build set of accessed binaries
+    tmp_used=$(mktemp)
+    if [ -f "$RAW_BIN" ]; then
+        awk '{print $2}' "$RAW_BIN" | sort -u > "$tmp_used"
+    else
+        touch "$tmp_used"
+    fi
+
+    used_count=$(wc -l < "$tmp_used")
+    echo "Binaries accessed during tracking period: $used_count"
+    echo ""
+
+    # Find all binaries on system
+    tmp_all=$(mktemp)
+    for d in $BIN_DIRS; do
+        [ -d "$d" ] && find "$d" -maxdepth 1 -type f -o -maxdepth 1 -type l 2>/dev/null
+    done | sort -u > "$tmp_all"
+
+    total=$(wc -l < "$tmp_all")
+
+    # Never accessed = in all but not in used
+    tmp_unused=$(mktemp)
+    comm -23 "$tmp_all" "$tmp_used" > "$tmp_unused"
+    unused_count=$(wc -l < "$tmp_unused")
+
+    echo "Total binaries on system: $total"
+    echo "Never accessed:           $unused_count  ($(( unused_count * 100 / total ))%)"
+    echo ""
+    echo "--- NEVER-ACCESSED BINARIES (candidates for removal) ---"
+    cat "$tmp_unused"
+
+    echo ""
+    echo "--- ACCESSED BINARIES ---"
+    cat "$tmp_used"
+
+    rm -f "$tmp_used" "$tmp_all" "$tmp_unused"
+}
+
+report_libraries() {
+    echo ""
+    echo "=== LIBRARY USAGE REPORT ==="
+    echo ""
+
+    tmp_used=$(mktemp)
+    if [ -f "$RAW_LIB" ]; then
+        awk '{print $2}' "$RAW_LIB" | sort -u > "$tmp_used"
+    else
+        touch "$tmp_used"
+    fi
+
+    used_count=$(wc -l < "$tmp_used")
+    echo "Libraries accessed during tracking period: $used_count"
+    echo ""
+
+    tmp_all=$(mktemp)
+    for d in $LIB_DIRS; do
+        [ -d "$d" ] && find "$d" -name "*.so*" -type f 2>/dev/null
+    done | sort -u > "$tmp_all"
+
+    total=$(wc -l < "$tmp_all")
+
+    tmp_unused=$(mktemp)
+    comm -23 "$tmp_all" "$tmp_used" > "$tmp_unused"
+    unused_count=$(wc -l < "$tmp_unused")
+
+    echo "Total .so files on system: $total"
+    echo "Never accessed:            $unused_count  ($(( unused_count * 100 / total ))%)"
+    echo ""
+    echo "--- NEVER-ACCESSED LIBRARIES ---"
+    cat "$tmp_unused"
+
+    echo ""
+    echo "--- ACCESSED LIBRARIES ---"
+    cat "$tmp_used"
+
+    rm -f "$tmp_used" "$tmp_all" "$tmp_unused"
+}
+
+summary_by_category() {
+    echo ""
+    echo "=== CATEGORY SUMMARY (never-accessed binaries) ==="
+    echo ""
+    if [ ! -f "$RAW_BIN" ]; then return; fi
+
+    tmp_used=$(mktemp)
+    awk '{print $2}' "$RAW_BIN" | sort -u > "$tmp_used"
+
+    tmp_all=$(mktemp)
+    for d in $BIN_DIRS; do
+        [ -d "$d" ] && find "$d" -maxdepth 1 -type f 2>/dev/null
+    done | sort -u > "$tmp_all"
+
+    comm -23 "$tmp_all" "$tmp_used" | while read -r bin; do
+        name=$(basename "$bin")
+        # Rough category heuristic based on name patterns
+        case "$name" in
+            ffmpeg|ffprobe|x264|x265|hevc*|vp9*|av1*|aom*|dav1d*) echo "video-codec: $name" ;;
+            bsd*|mac*|hfs*|apfs*|ntfs*|exfat*|fat*|vfat*|udf*)    echo "foreign-fs:  $name" ;;
+            samba*|nmb*|winbind*|cifs*)                             echo "windows-net: $name" ;;
+            bt*|blue*|obex*|rfcomm*|hid*)                          echo "bluetooth:   $name" ;;
+            *jack*|pulse*|alsa*|aplay*|arecord*|amixer*)           echo "audio:       $name" ;;
+            cups*|lp*|lpq*|lpr*)                                    echo "printing:    $name" ;;
+            perl*|python*|ruby*|php*|lua*)                          echo "interpreter: $name" ;;
+            *test*|*bench*|*demo*)                                  echo "test-bench:  $name" ;;
+            *)                                                       echo "other:       $name" ;;
+        esac
+    done | sort | column -t
+
+    rm -f "$tmp_used" "$tmp_all"
+}
+
+# Main
+check_data
+
+{
+    echo "Usage Tracker Report"
+    echo "Generated: $(date)"
+    echo "Tracking log: $LOG_DIR"
+    echo ""
+
+    if [ "${1}" = "--libs" ] || [ "${1}" = "-l" ]; then
+        report_libraries
+    elif [ "${1}" = "--all" ] || [ "${1}" = "-a" ]; then
+        report_binaries
+        report_libraries
+        summary_by_category
+    else
+        report_binaries
+        summary_by_category
+        echo ""
+        echo "Tip: run 'usage-report --libs' for library report, '--all' for both."
+    fi
+} | tee "$REPORT"
+
+echo ""
+echo "Report saved to: $REPORT"

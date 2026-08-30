@@ -1,0 +1,196 @@
+#!/bin/sh
+# fd-yayos-waydroid — Waydroid lifecycle management for Fatdog64
+# No systemd — uses direct waydroid commands.
+#
+# Usage:
+#   fd-yayos-waydroid init          first-time setup (downloads Android image)
+#   fd-yayos-waydroid start         start container + session
+#   fd-yayos-waydroid stop          stop session + container
+#   fd-yayos-waydroid status        show container / session / image status
+#   fd-yayos-waydroid ui            open full Android UI
+#   fd-yayos-waydroid launch <pkg>  launch an Android app by package name
+#   fd-yayos-waydroid install <apk> install an APK
+
+IMAGES_DIR="/var/lib/waydroid/images"
+
+_session_active() {
+    waydroid status 2>/dev/null | grep -q "Session.*RUNNING"
+}
+
+_container_active() {
+    waydroid status 2>/dev/null | grep -q "Container.*RUNNING"
+}
+
+cmd_init() {
+    if [ -f "$IMAGES_DIR/system.img" ]; then
+        echo "Waydroid already initialised (system.img present)"
+        echo "Run: fd-yayos-waydroid start"
+        return
+    fi
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Waydroid init must run as root. Use: sudo fd-yayos-waydroid init" >&2
+        exit 1
+    fi
+    echo "Initialising Waydroid — this downloads ~500 MB…"
+    waydroid init -s GAPPS -f
+    echo "Init complete. Run: fd-yayos-waydroid start"
+}
+
+cmd_start() {
+    if ! [ -f "$IMAGES_DIR/system.img" ]; then
+        echo "Waydroid not initialised. Images missing." >&2
+        exit 1
+    fi
+
+    # Waydroid needs a Wayland compositor. On X11 (Fatdog64), start weston.
+    if [ -z "$WAYLAND_DISPLAY" ]; then
+        WAYLAND_DISPLAY=wayland-0
+        export WAYLAND_DISPLAY
+    fi
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-root}"
+    export XDG_RUNTIME_DIR
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod 700 "$XDG_RUNTIME_DIR"
+
+    if [ ! -e "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        # Export X11 auth so weston can connect to the X server
+        : "${DISPLAY:=:0}"
+        export DISPLAY
+        [ -z "$XAUTHORITY" ] && [ -f /root/.Xauthority ] && export XAUTHORITY=/root/.Xauthority
+
+        if command -v weston >/dev/null 2>&1; then
+            echo "Starting nested Weston compositor on X11…"
+            weston --backend=x11-backend.so --use-pixman --socket="$WAYLAND_DISPLAY" &
+            WESTON_PID=$!
+            sleep 2
+        elif command -v cage >/dev/null 2>&1; then
+            echo "Starting Cage compositor…"
+            cage -- &
+            sleep 2
+        else
+            echo "WARNING: No Wayland compositor found. Waydroid needs Weston or Cage on X11." >&2
+        fi
+    fi
+
+    # Container must run as root
+    if ! _container_active; then
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "Starting Waydroid container…"
+            waydroid container start &
+        else
+            echo "Starting Waydroid container (sudo)…"
+            sudo waydroid container start &
+        fi
+        sleep 2
+    fi
+
+    # Session runs as the user
+    if ! _session_active; then
+        echo "Starting Waydroid session…"
+        waydroid session start &
+        SESSION_PID=$!
+    fi
+
+    # Wait for session (up to 30s)
+    i=0
+    while [ $i -lt 30 ]; do
+        _session_active && break
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if _session_active; then
+        echo "Waydroid running — use: fd-yayos-waydroid ui"
+        notify-send -i display "Waydroid" "Container and session started" 2>/dev/null || true
+    else
+        echo "Session did not become ready in 30s — check: waydroid log" >&2
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    echo "Stopping Waydroid session…"
+    waydroid session stop 2>/dev/null || true
+    echo "Stopping Waydroid container…"
+    if [ "$(id -u)" -eq 0 ]; then
+        waydroid container stop 2>/dev/null || true
+    else
+        sudo waydroid container stop 2>/dev/null || true
+    fi
+    echo "Waydroid stopped"
+    notify-send -i display "Waydroid" "Stopped" 2>/dev/null || true
+}
+
+cmd_status() {
+    printf 'Container: '
+    if _container_active; then printf 'RUNNING\n'; else printf 'stopped\n'; fi
+    printf 'Session:   '
+    if _session_active; then printf 'RUNNING\n'; else printf 'stopped\n'; fi
+    printf 'Images:    '
+    if [ -f "$IMAGES_DIR/system.img" ]; then
+        du -sh "$IMAGES_DIR" 2>/dev/null | cut -f1
+    else
+        printf '(not initialised)\n'
+    fi
+}
+
+cmd_ui() {
+    if ! _session_active; then
+        echo "Session not running. Start it first: fd-yayos-waydroid start" >&2
+        exit 1
+    fi
+    waydroid show-full-ui
+}
+
+cmd_launch() {
+    pkg="$1"
+    [ -z "$pkg" ] && { echo "Usage: fd-yayos-waydroid launch <package>" >&2; exit 1; }
+    if ! _session_active; then
+        echo "Session not running. Start it first: fd-yayos-waydroid start" >&2
+        exit 1
+    fi
+    waydroid app launch "$pkg"
+}
+
+cmd_install() {
+    apk="$1"
+    [ -z "$apk" ] && { echo "Usage: fd-yayos-waydroid install <apk>" >&2; exit 1; }
+    [ -f "$apk" ] || { echo "File not found: $apk" >&2; exit 1; }
+    if ! _session_active; then
+        echo "Session not running. Start it first: fd-yayos-waydroid start" >&2
+        exit 1
+    fi
+    waydroid app install "$apk"
+}
+
+cmd="${1:-status}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    init)    cmd_init ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    ui)      cmd_ui ;;
+    launch)  cmd_launch "$1" ;;
+    install) cmd_install "$1" ;;
+    -h|--help|help)
+        cat <<'EOF'
+fd-yayos-waydroid — Waydroid lifecycle for Fatdog64
+
+  init             first-time setup (downloads ~500 MB Android image)
+  start            start container + user session
+  stop             stop session + container
+  status           show container / session / image status
+  ui               open full Android UI
+  launch <pkg>     launch an installed Android app
+  install <apk>    sideload an APK
+
+First use:
+  sudo fd-yayos-waydroid init
+  fd-yayos-waydroid start
+  fd-yayos-waydroid ui
+EOF
+        ;;
+    *) printf 'Unknown command: %s\nTry: fd-yayos-waydroid help\n' "$cmd" >&2; exit 1 ;;
+esac

@@ -1,0 +1,167 @@
+#!/bin/sh
+# fd-yayos-ctrl — unified display & network control for Fatdog64
+# No systemd, no Wayland — uses sysfs, amixer, xgamma, xrandr.
+#
+# Usage:
+#   fd-yayos-ctrl              — show current status
+#   fd-yayos-ctrl --display    — floating display controls
+#   fd-yayos-ctrl --network    — network status
+#   fd-yayos-ctrl brightness N — set screen brightness to N% (0-100)
+#   fd-yayos-ctrl kbdlight N   — set keyboard backlight to N% (0-100)
+#   fd-yayos-ctrl volume N     — set master volume to N% (0-100)
+#   fd-yayos-ctrl mute         — toggle mute
+#   fd-yayos-ctrl gamma N      — set gamma to N (0.1 - 10.0, default 1.0)
+
+set -e
+
+SCREEN_BL=/sys/class/backlight/intel_backlight
+KBD_BL=/sys/class/leds/chromeos::kbd_backlight
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+get_screen_pct() {
+    if [ -f "$SCREEN_BL/brightness" ]; then
+        max=$(cat "$SCREEN_BL/max_brightness")
+        cur=$(cat "$SCREEN_BL/brightness")
+        echo $((cur * 100 / max))
+    else
+        echo "?"
+    fi
+}
+
+set_screen_pct() {
+    pct="$1"
+    if [ -f "$SCREEN_BL/max_brightness" ]; then
+        max=$(cat "$SCREEN_BL/max_brightness")
+        val=$((max * pct / 100))
+        [ "$val" -lt 1 ] && val=1
+        echo "$val" > "$SCREEN_BL/brightness"
+        echo "$val" > /root/.brightness 2>/dev/null || true
+    fi
+}
+
+get_kbd_pct() {
+    if [ -f "$KBD_BL/brightness" ]; then
+        max=$(cat "$KBD_BL/max_brightness")
+        cur=$(cat "$KBD_BL/brightness")
+        echo $((cur * 100 / max))
+    else
+        echo "?"
+    fi
+}
+
+set_kbd_pct() {
+    pct="$1"
+    if [ -f "$KBD_BL/max_brightness" ]; then
+        max=$(cat "$KBD_BL/max_brightness")
+        val=$((max * pct / 100))
+        [ "$val" -lt 0 ] && val=0
+        echo "$val" > "$KBD_BL/brightness"
+        echo "$val" > /root/.kbdlight 2>/dev/null || true
+    fi
+}
+
+get_volume_pct() {
+    amixer get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1 || echo "?"
+}
+
+set_volume_pct() {
+    pct="$1"
+    amixer set Master "${pct}%" >/dev/null 2>&1 || true
+}
+
+toggle_mute() {
+    amixer set Master toggle >/dev/null 2>&1 || true
+}
+
+set_gamma() {
+    g="$1"
+    xgamma -gamma "$g" >/dev/null 2>&1 || true
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    echo "Screen brightness: $(get_screen_pct)%"
+    echo "Kbd backlight:     $(get_kbd_pct)%"
+    echo "Volume:            $(get_volume_pct)%"
+    echo "Gamma:             $(xgamma 2>/dev/null | sed -n 's/.*Red *\([0-9.]*\).*/\1/p' | head -1 || echo '?')"
+    echo ""
+    echo "Network interfaces:"
+    ifconfig 2>/dev/null | grep -E "^[^ ]+|inet " | head -20 || true
+}
+
+# ── display ───────────────────────────────────────────────────────────────────
+
+cmd_display() {
+    yad --form --title="Display" --width=300 \
+        --field="Brightness":SCL "$(get_screen_pct)" \
+        --field="Kbd Light":SCL "$(get_kbd_pct)" \
+        --field="Gamma":SCL "1.0" \
+        --button="Apply":0 --button="Close":1 \
+        2>/dev/null | while IFS='|' read -r br kl ga; do
+            [ -n "$br" ] && set_screen_pct "${br%.*}"
+            [ -n "$kl" ] && set_kbd_pct "${kl%.*}"
+            [ -n "$ga" ] && set_gamma "$ga"
+        done || true
+}
+
+# ── network ───────────────────────────────────────────────────────────────────
+
+cmd_network() {
+    echo "=== Network Interfaces ==="
+    ifconfig 2>/dev/null | grep -E "^[^ ]+" | while read iface rest; do
+        echo "Interface: $iface"
+        ifconfig "$iface" 2>/dev/null | grep -E "inet |RX packets|TX packets" | sed 's/^/  /'
+        echo ""
+    done
+    echo "=== WiFi ==="
+    iwconfig 2>/dev/null | grep -E "ESSID|Mode|Quality" || echo "  (no wireless info)"
+    echo ""
+    echo "=== Routes ==="
+    route -n 2>/dev/null || ip route 2>/dev/null || true
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+cmd="${1:-status}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    status|--status|"")
+        cmd_status ;;
+    --display|display)
+        cmd_display ;;
+    --network|network)
+        cmd_network ;;
+    brightness)
+        set_screen_pct "${1:-50}"
+        echo "Brightness set to $(get_screen_pct)%" ;;
+    kbdlight)
+        set_kbd_pct "${1:-50}"
+        echo "Keyboard backlight set to $(get_kbd_pct)%" ;;
+    volume)
+        set_volume_pct "${1:-50}"
+        echo "Volume set to $(get_volume_pct)%" ;;
+    mute)
+        toggle_mute
+        echo "Mute toggled" ;;
+    gamma)
+        set_gamma "${1:-1.0}"
+        echo "Gamma set to ${1:-1.0}" ;;
+    -h|--help|help)
+        cat <<'EOF'
+fd-yayos-ctrl — system control for Fatdog64
+
+  status                show brightness, kbd light, volume, network
+  --display             open display control dialog (requires yad)
+  --network             show network info
+  brightness N          set screen brightness to N% (0-100)
+  kbdlight N            set keyboard backlight to N% (0-100)
+  volume N              set master volume to N% (0-100)
+  mute                  toggle mute
+  gamma N               set gamma (0.1 - 10.0)
+EOF
+        ;;
+    *) printf 'Unknown command: %s\nTry: fd-yayos-ctrl help\n' "$cmd" >&2; exit 1 ;;
+esac

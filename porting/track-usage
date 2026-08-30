@@ -1,0 +1,110 @@
+#!/bin/bash
+# Usage tracker: monitors which binaries and libraries are accessed over 2-3 days.
+# Run once: track-usage start
+# Stop:     track-usage stop
+# Status:   track-usage status
+
+LOG_DIR="/var/log/usage-tracker"
+PID_BIN="$LOG_DIR/tracker-bin.pid"
+PID_LIB="$LOG_DIR/tracker-lib.pid"
+RAW_BIN="$LOG_DIR/raw-bin.log"
+RAW_LIB="$LOG_DIR/raw-lib.log"
+
+BIN_DIRS="/bin /sbin /usr/bin /usr/sbin"
+LIB_DIRS="/usr/lib64 /usr/lib /lib /lib64"
+
+start() {
+    mkdir -p "$LOG_DIR"
+
+    # Raise inotify watch limit if needed (7000+ files in lib dirs)
+    current=$(cat /proc/sys/fs/inotify/max_user_watches)
+    if [ "$current" -lt 65536 ]; then
+        echo 65536 > /proc/sys/fs/inotify/max_user_watches
+        echo "Raised inotify max_user_watches to 65536"
+    fi
+
+    if [ -f "$PID_BIN" ] && kill -0 "$(cat $PID_BIN)" 2>/dev/null; then
+        echo "Binary tracker already running (pid $(cat $PID_BIN))"
+    else
+        # Watch binary dirs for open events; deduplicate per day via awk
+        inotifywait -m -q \
+            --timefmt '%Y-%m-%d' \
+            --format '%T %w%f' \
+            -e open \
+            $BIN_DIRS \
+            2>/dev/null \
+        | awk '{ key=$1" "$2; if (!seen[key]++) print $0 }' \
+        >> "$RAW_BIN" &
+        echo $! > "$PID_BIN"
+        echo "Binary tracker started (pid $!)"
+    fi
+
+    if [ -f "$PID_LIB" ] && kill -0 "$(cat $PID_LIB)" 2>/dev/null; then
+        echo "Library tracker already running (pid $(cat $PID_LIB))"
+    else
+        # Watch lib dirs recursively, only .so files, deduplicate per day
+        inotifywait -m -q -r \
+            --timefmt '%Y-%m-%d' \
+            --format '%T %w%f' \
+            -e open \
+            --include '\.so' \
+            $LIB_DIRS \
+            2>/dev/null \
+        | awk '{ key=$1" "$2; if (!seen[key]++) print $0 }' \
+        >> "$RAW_LIB" &
+        echo $! > "$PID_LIB"
+        echo "Library tracker started (pid $!)"
+    fi
+
+    echo ""
+    echo "Logging to: $LOG_DIR"
+    echo "Run 'usage-report' after 2-3 days to see what can be removed."
+}
+
+stop() {
+    for pidfile in "$PID_BIN" "$PID_LIB"; do
+        if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            if kill -0 "$pid" 2>/dev/null; then
+                # Kill the inotifywait + its awk child
+                pkill -P "$pid" 2>/dev/null
+                kill "$pid" 2>/dev/null
+                echo "Stopped pid $pid"
+            fi
+            rm -f "$pidfile"
+        fi
+    done
+}
+
+status() {
+    for entry in "Binary:$PID_BIN" "Library:$PID_LIB"; do
+        label="${entry%%:*}"
+        pidfile="${entry#*:}"
+        if [ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null; then
+            echo "$label tracker: RUNNING (pid $(cat $pidfile))"
+        else
+            echo "$label tracker: STOPPED"
+        fi
+    done
+
+    if [ -f "$RAW_BIN" ]; then
+        echo "Binary events logged: $(wc -l < $RAW_BIN)"
+    fi
+    if [ -f "$RAW_LIB" ]; then
+        echo "Library events logged: $(wc -l < $RAW_LIB)"
+    fi
+}
+
+case "$1" in
+    start)  start ;;
+    stop)   stop ;;
+    status) status ;;
+    restart) stop; start ;;
+    *)
+        echo "Usage: track-usage {start|stop|status|restart}"
+        echo ""
+        echo "Tracks binary and library accesses over 2-3 days."
+        echo "Results in: $LOG_DIR"
+        exit 1
+        ;;
+esac

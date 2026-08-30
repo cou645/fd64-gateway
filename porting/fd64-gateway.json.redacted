@@ -1,0 +1,18 @@
+{
+  "providers": {
+    "anthropic": {
+      "api_key": "<REDACTED>",
+      "default_model": "claude-opus-4-8"
+    },
+    "deepseek": {
+      "api_key": "<REDACTED>",
+      "url": "https://api.deepseek.com",
+      "default_model": "deepseek-chat"
+    },
+    "nvidia": {
+      "api_key": "<REDACTED>",
+      "url": "https://integrate.api.nvidia.com",
+      "default_model": "moonshotai/kimi-k2.6"
+    }
+  }
+}

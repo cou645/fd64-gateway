@@ -1,0 +1,20 @@
+{
+  "capabilities": {
+    "allow_unauthenticated": true
+  },
+  "providers": {
+    "anthropic": {
+      "api_key": "<REDACTED>",
+      "default_model": "claude-sonnet-4-6"
+    },
+    "openai": {
+      "api_key": "<REDACTED>",
+      "default_model": "gpt-4o-mini"
+    },
+    "local": {
+      "url": "http://localhost:11434",
+      "default_model": "llama3",
+      "api_key": "<REDACTED>"
+    }
+  }
+}

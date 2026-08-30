@@ -1,0 +1,12 @@
+#!/bin/sh
+# Kill any existing gateway process before starting
+rm -f /run/trixie-gateway.sock 2>/dev/null
+sleep 1
+# Load ALSA loopback for audio streaming (creates card 3 device 0/1)
+modprobe snd-aloop 2>/dev/null
+# Route playback through the tee (USB speaker + loopback) so audio can be streamed
+export ALSA_PCMOUT=fdtee
+# fatdog64-style /aufs stacking fallback (cross-distro)
+GW=/mnt/sda2/YaYOS/trixie-gateway/gateway.py
+[ -f "$GW" ] || GW=/aufs/devbase/trixie-gateway/gateway.py
+exec python3 "$GW" >> /var/log/trixie-gateway.log 2>&1
